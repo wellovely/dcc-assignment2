@@ -10,6 +10,9 @@ import counter_pb2_grpc
 
 class CounterServicer(counter_pb2_grpc.CounterServicer):
     def __init__(self):
+        # A3: this single lock protects ALL shared state (_values and _seen).
+        # The dedup check and the mutation run in one critical section, so neither
+        # concurrent increments nor concurrent retries with the same key can interleave.
         self._lock = threading.Lock()
         self._values = {}  # counter_id -> int
         self._seen = {}    # idempotency_key -> (counter_id, resulting value)
@@ -39,6 +42,7 @@ class CounterServicer(counter_pb2_grpc.CounterServicer):
 def start_server(port=0):
     """Start a server in the background. port=0 means 'pick any free port' (used by tests)."""
     servicer = CounterServicer()
+    # A3: up to 8 requests are handled in parallel; shared state is guarded by servicer._lock
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
     counter_pb2_grpc.add_CounterServicer_to_server(servicer, server)
     bound_port = server.add_insecure_port(f"[::]:{port}")
