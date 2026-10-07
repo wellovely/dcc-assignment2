@@ -3,8 +3,8 @@ import sys
 import time
 import uuid
 from collections import Counter
-from concurrent import futures
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Optional
 
 import grpc
@@ -20,15 +20,11 @@ RETRYABLE = {grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.UNAVAILABLE}
 
 @dataclass
 class IncrementResult:
-    committed: bool = False
-    new_value: Optional[int] = None  # None when not committed: a minority value is never presented as committed
-    was_duplicate: bool = False
-    total: int = 0                   # number of replicas the write was sent to
-    outcomes: dict = field(default_factory=dict)  # address -> "OK" or gRPC status name, filled as replies arrive
-
-    @property
-    def acks(self):
-        return sum(1 for o in list(self.outcomes.values()) if o == "OK")
+    committed: bool                  # True when a majority of replicas acknowledged
+    new_value: Optional[int]         # None when not committed: a minority value is never reported
+    was_duplicate: bool
+    acks: int                        # how many replicas acknowledged
+    total: int                       # how many replicas the write was sent to
 
 
 class CounterClient:
@@ -36,25 +32,18 @@ class CounterClient:
                  name="client-1", log_path=None):
         if isinstance(addresses, str):
             addresses = addresses.split(",")
-        self.addresses = [a.strip() for a in addresses]
-        self._channels = [grpc.insecure_channel(a) for a in self.addresses]
+        self.addresses = addresses
+        self._channels = [grpc.insecure_channel(a) for a in addresses]
         self._stubs = [counter_pb2_grpc.CounterStub(c) for c in self._channels]
-        self.majority = len(self.addresses) // 2 + 1  # C1: 2 of 3 (1 of 1 for a single replica)
+        self.majority = len(addresses) // 2 + 1  # C1: 2 of 3 (1 of 1 for a single replica)
         self.timeout = timeout            # deadline for every single attempt, seconds
         self.max_retries = max_retries    # retries AFTER the first attempt
         self.base_backoff = base_backoff  # 0.2 -> 0.4 -> 0.8 s
         self.clock = LamportClock(name, log_path)  # B1: this client's logical clock
-        self._pool = futures.ThreadPoolExecutor(max_workers=32)  # parallel sends to replicas
-        self._inflight = []               # sends still running after the write already committed
-
-    def flush(self):
-        """Wait until replies (or final errors) from ALL replicas have arrived."""
-        futures.wait(self._inflight)
-        self._inflight = []
+        self._pool = ThreadPoolExecutor(max_workers=len(addresses))  # one thread per replica
 
     def close(self):
-        self.flush()
-        self._pool.shutdown(wait=True)
+        self._pool.shutdown()
         for channel in self._channels:
             channel.close()
         self.clock.close()
@@ -74,15 +63,6 @@ class CounterClient:
             self.clock.receive(reply_desc(reply), reply.lamport_time)
             return reply
 
-    def _send_to_replica(self, result, address, stub, build_request, send_desc, reply_desc):
-        try:
-            reply = self._call_with_retry(stub.Increment, build_request, send_desc, reply_desc)
-        except grpc.RpcError as e:
-            result.outcomes[address] = e.code().name
-            raise
-        result.outcomes[address] = "OK"
-        return reply
-
     def incr(self, counter_id, delta, key=None):
         # The key is created ONCE per logical operation and reused on every retry
         # and on every replica, so each replica's dedup store recognises a retry.
@@ -94,31 +74,25 @@ class CounterClient:
                 counter_id=counter_id, delta=delta, idempotency_key=key,
                 lamport_time=lamport_time)
 
-        send_desc = f"Increment(counter={counter_id}, delta={delta})"
-        reply_desc = lambda r: f"IncrementReply(new_value={r.new_value})"
+        def send_to(stub):
+            try:
+                return self._call_with_retry(
+                    stub.Increment, build_request,
+                    f"Increment(counter={counter_id}, delta={delta})",
+                    lambda r: f"IncrementReply(new_value={r.new_value})")
+            except grpc.RpcError:
+                return None  # this replica did not acknowledge
 
-        # C1: send the write to ALL replicas in parallel ...
-        result = IncrementResult(total=len(self.addresses))
-        sends = [self._pool.submit(self._send_to_replica, result, address, stub,
-                                   build_request, send_desc, reply_desc)
-                 for address, stub in zip(self.addresses, self._stubs)]
+        # C1: send to ALL replicas in parallel and wait for every answer
+        replies = list(self._pool.map(send_to, self._stubs))
+        acks = [r for r in replies if r is not None]
 
-        # ... and stop waiting as soon as a majority has acknowledged it.
-        replies = []
-        for done in futures.as_completed(sends):
-            if done.exception() is None:
-                replies.append(done.result())
-            if len(replies) >= self.majority:
-                break
-
-        # slower replicas keep going in the background; flush()/close() waits for them
-        self._inflight = [f for f in self._inflight + sends if not f.done()]
-
-        if len(replies) >= self.majority:
-            result.committed = True
-            result.new_value = Counter(r.new_value for r in replies).most_common(1)[0][0]
-            result.was_duplicate = any(r.was_duplicate for r in replies)
-        return result
+        # committed only if a majority acknowledged
+        if len(acks) < self.majority:
+            return IncrementResult(False, None, False, len(acks), len(replies))
+        value = Counter(r.new_value for r in acks).most_common(1)[0][0]  # value most replicas agree on
+        duplicate = any(r.was_duplicate for r in acks)
+        return IncrementResult(True, value, duplicate, len(acks), len(replies))
 
     def get(self, counter_id):
         # C1: a read goes to a single replica (the first one that answers)
@@ -163,14 +137,12 @@ def main():
         for _ in range(args.repeat):
             if args.cmd == "incr":
                 result = client.incr(args.counter_id, args.by, key=args.key)
-                client.flush()  # CLI only: wait for slow replicas so the ack count is final
                 acked = f"replicas acked: {result.acks}/{result.total}"
                 if result.committed:
                     dup = "yes" if result.was_duplicate else "no"
                     print(f"OK committed value={result.new_value} ({acked}, duplicate: {dup})")
                 else:
-                    errors = {a: o for a, o in result.outcomes.items() if o != "OK"}
-                    print(f"FAILED not committed ({acked}, majority is {client.majority}; errors: {errors})")
+                    print(f"FAILED not committed ({acked}, majority is {client.majority})")
                     failed = True
             else:
                 reply = client.get(args.counter_id)
