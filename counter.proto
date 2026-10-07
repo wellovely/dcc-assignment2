@@ -1,5 +1,5 @@
-syntax = "proto3";
-package counter;
+syntax = "proto3"; // это версия языка protobuf
+package counter; // пространство имен, чтобы имена не конфликтовали с другими proto
 
 service Counter {
   rpc Increment (IncrementRequest) returns (IncrementReply);
