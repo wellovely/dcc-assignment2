@@ -76,6 +76,8 @@ def main():
     parser.add_argument("--addr", default="localhost:50051", help="replica address host:port")
     parser.add_argument("--name", default="client-1", help="process name in the event log")
     parser.add_argument("--log", default=None, help="event log file (default: stderr)")
+    parser.add_argument("--repeat", type=int, default=1,
+                        help="run the command N times in this process (one Lamport clock, new key each time)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_incr = sub.add_parser("incr", help="increment a counter")
@@ -89,13 +91,14 @@ def main():
     args = parser.parse_args()
     client = CounterClient(args.addr, name=args.name, log_path=args.log)
     try:
-        if args.cmd == "incr":
-            reply = client.incr(args.counter_id, args.by, key=args.key)
-            dup = "yes" if reply.was_duplicate else "no"
-            print(f"OK committed value={reply.new_value} (duplicate: {dup})")
-        else:
-            reply = client.get(args.counter_id)
-            print(f"value={reply.value}" if reply.found else "not found")
+        for _ in range(args.repeat):
+            if args.cmd == "incr":
+                reply = client.incr(args.counter_id, args.by, key=args.key)
+                dup = "yes" if reply.was_duplicate else "no"
+                print(f"OK committed value={reply.new_value} (duplicate: {dup})")
+            else:
+                reply = client.get(args.counter_id)
+                print(f"value={reply.value}" if reply.found else "not found")
     except grpc.RpcError as e:
         print(f"FAILED after {client.attempts} attempt(s): {e.code().name} {e.details()}")
         sys.exit(1)
