@@ -10,8 +10,9 @@ message IncrementRequest {
   string counter_id      = 1;
   int64  delta           = 2;
   string idempotency_key = 3;   // client-generated, unique per logical operation
+  uint64 lamport_time    = 4;   // sender's Lamport clock at SEND
 }
-message IncrementReply { int64 new_value = 1; bool was_duplicate = 2; }
+message IncrementReply { int64 new_value = 1; bool was_duplicate = 2; uint64 lamport_time = 4; }
 
-message GetRequest { string counter_id = 1; }
-message GetReply   { int64 value = 1; bool found = 2; }
+message GetRequest { string counter_id = 1; uint64 lamport_time = 4; }
+message GetReply   { int64 value = 1; bool found = 2; uint64 lamport_time = 4; }
