@@ -51,9 +51,9 @@ def test_get_missing_counter(running_server):
     assert reply.found is False
 
 
-def test_retry_after_timeout_is_safe(make_cluster):
+def test_retry_after_timeout_is_safe(slow_server):
     # the replica applies the first write but replies after 800 ms; the client deadline is 300 ms
-    slow = make_cluster(1, {0: {"delay_ms": 800}})
+    slow = slow_server
     client = slow.new_client(timeout=0.3, **FAST)
 
     result = client.incr("t", 1)

@@ -14,14 +14,12 @@ from client import CounterClient  # noqa: E402
 class Cluster:
     """N independent replicas, each with its own state, started with server.start_server(port=0)."""
 
-    def __init__(self, log_dir, n, replica_options=None):
-        replica_options = replica_options or {}
+    def __init__(self, log_dir, n, delay_ms=0):
         self.log_dir = log_dir
         self.replicas = []  # (grpc_server, port, servicer)
         for i in range(n):
-            name = f"replica-{'ABCDE'[i]}"
-            self.replicas.append(server.start_server(
-                0, name, str(log_dir / f"{name}.log"), **replica_options.get(i, {})))
+            name = f"replica-{'ABC'[i]}"
+            self.replicas.append(server.start_server(0, name, str(log_dir / f"{name}.log"), delay_ms=delay_ms))
         self._clients = []
 
     @property
@@ -41,7 +39,7 @@ class Cluster:
         return self.replicas[i][2].snapshot()
 
     def log(self, i):
-        return (self.log_dir / f"replica-{'ABCDE'[i]}.log").read_text()
+        return (self.log_dir / f"replica-{'ABC'[i]}.log").read_text()
 
     def shutdown(self):
         for client in self._clients:
@@ -51,27 +49,24 @@ class Cluster:
 
 
 @pytest.fixture
-def make_cluster(tmp_path):
-    """Factory: make_cluster(n, replica_options={index: {"fault": ..., "delay_ms": ...}})."""
-    clusters = []
-
-    def make(n, replica_options=None):
-        cluster = Cluster(tmp_path, n, replica_options)
-        clusters.append(cluster)
-        return cluster
-
-    yield make
-    for cluster in clusters:
-        cluster.shutdown()
-
-
-@pytest.fixture
-def running_server(make_cluster):
+def running_server(tmp_path):
     """A single replica (Part A setup)."""
-    return make_cluster(1)
+    cluster = Cluster(tmp_path, 1)
+    yield cluster
+    cluster.shutdown()
 
 
 @pytest.fixture
-def cluster(make_cluster):
+def slow_server(tmp_path):
+    """A single replica that replies to its first Increment after 800 ms."""
+    cluster = Cluster(tmp_path, 1, delay_ms=800)
+    yield cluster
+    cluster.shutdown()
+
+
+@pytest.fixture
+def cluster(tmp_path):
     """Three replicas (Part C setup)."""
-    return make_cluster(3)
+    cluster = Cluster(tmp_path, 3)
+    yield cluster
+    cluster.shutdown()

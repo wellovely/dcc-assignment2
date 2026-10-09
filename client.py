@@ -27,6 +27,17 @@ class IncrementResult:
     total: int                       # how many replicas the write was sent to
 
 
+def describe(message):
+    """Text of a message for the event log, e.g. Increment(counter=x, delta=1)."""
+    if isinstance(message, counter_pb2.IncrementRequest):
+        return f"Increment(counter={message.counter_id}, delta={message.delta})"
+    if isinstance(message, counter_pb2.IncrementReply):
+        return f"IncrementReply(new_value={message.new_value})"
+    if isinstance(message, counter_pb2.GetRequest):
+        return f"Get(counter={message.counter_id})"
+    return f"GetReply(value={message.value}, found={message.found})"
+
+
 class CounterClient:
     def __init__(self, addresses, timeout=2.0, max_retries=3, base_backoff=0.2,
                  name="client-1", log_path=None):
@@ -48,43 +59,39 @@ class CounterClient:
             channel.close()
         self.clock.close()
 
-    def _call_with_retry(self, rpc, build_request, send_desc, reply_desc):
+    def _call_with_retry(self, rpc, request):
         for attempt in range(self.max_retries + 1):
-            # every attempt is a new SEND event with a fresh Lamport time,
-            # but build_request always puts the SAME idempotency key inside
-            lamport_time = self.clock.tick("SEND", send_desc)
+            # each attempt is a new SEND event with a fresh Lamport time;
+            # the rest of the request (including the idempotency key) stays the same
+            request.lamport_time = self.clock.tick("SEND", describe(request))
             try:
-                reply = rpc(build_request(lamport_time), timeout=self.timeout)
+                reply = rpc(request, timeout=self.timeout)
             except grpc.RpcError as e:
                 if e.code() not in RETRYABLE or attempt == self.max_retries:
                     raise
                 time.sleep(self.base_backoff * (2 ** attempt))
                 continue
-            self.clock.receive(reply_desc(reply), reply.lamport_time)
+            self.clock.receive(describe(reply), reply.lamport_time)
             return reply
+
+    def _send_increment(self, stub, request):
+        """Send to one replica. Returns its reply, or None if it did not acknowledge."""
+        request = counter_pb2.IncrementRequest(  # own copy: each replica's thread sets its own lamport_time
+            counter_id=request.counter_id, delta=request.delta, idempotency_key=request.idempotency_key)
+        try:
+            return self._call_with_retry(stub.Increment, request)
+        except grpc.RpcError:
+            return None
 
     def incr(self, counter_id, delta, key=None):
         # The key is created ONCE per logical operation and reused on every retry
         # and on every replica, so each replica's dedup store recognises a retry.
         if key is None:
             key = str(uuid.uuid4())
-
-        def build_request(lamport_time):
-            return counter_pb2.IncrementRequest(
-                counter_id=counter_id, delta=delta, idempotency_key=key,
-                lamport_time=lamport_time)
-
-        def send_to(stub):
-            try:
-                return self._call_with_retry(
-                    stub.Increment, build_request,
-                    f"Increment(counter={counter_id}, delta={delta})",
-                    lambda r: f"IncrementReply(new_value={r.new_value})")
-            except grpc.RpcError:
-                return None  # this replica did not acknowledge
+        request = counter_pb2.IncrementRequest(counter_id=counter_id, delta=delta, idempotency_key=key)
 
         # C1: send to ALL replicas in parallel and wait for every answer
-        replies = list(self._pool.map(send_to, self._stubs))
+        replies = list(self._pool.map(lambda stub: self._send_increment(stub, request), self._stubs))
         acks = [r for r in replies if r is not None]
 
         # committed only if a majority acknowledged
@@ -96,16 +103,10 @@ class CounterClient:
 
     def get(self, counter_id):
         # C1: a read goes to a single replica (the first one that answers)
-        def build_request(lamport_time):
-            return counter_pb2.GetRequest(counter_id=counter_id, lamport_time=lamport_time)
-
         last_error = None
         for stub in self._stubs:
             try:
-                return self._call_with_retry(
-                    stub.Get, build_request,
-                    f"Get(counter={counter_id})",
-                    lambda r: f"GetReply(value={r.value}, found={r.found})")
+                return self._call_with_retry(stub.Get, counter_pb2.GetRequest(counter_id=counter_id))
             except grpc.RpcError as e:
                 last_error = e
         raise last_error
