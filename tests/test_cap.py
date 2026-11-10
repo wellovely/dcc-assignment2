@@ -134,9 +134,13 @@ class CapCluster:
     def __init__(self, log_dir, sync_interval_ms=100, write_quorum=None):
         self.log_dir = log_dir
         self.net = Network()
-        self.ports = {n: free_port() for n in NODES}
+        # proxies first: they keep their ports bound, so free_port() below cannot hand
+        # a node the same port as a proxy
         for src, dst in itertools.permutations(NODES, 2):
-            self.net.proxies[(src, dst)] = LinkProxy(src, dst, self.ports[dst], self.net)
+            self.net.proxies[(src, dst)] = LinkProxy(src, dst, None, self.net)
+        self.ports = {n: free_port() for n in NODES}
+        for (src, dst), proxy in self.net.proxies.items():
+            proxy.target_port = self.ports[dst]
 
         self.procs = {}
         for n in NODES:
@@ -278,3 +282,44 @@ def test_linearizable_read_unavailable_on_minority(cap):
         cap.client.get("x", LINEARIZABLE, node="C")  # C cannot reach the leaseholder
     assert error.value.code() == grpc.StatusCode.UNAVAILABLE
     assert cap.client.get("x", LINEARIZABLE, node="B").value == "v1"  # the majority side still can
+
+
+# ---------------------------------------------------------------- quorum arithmetic (R + W > N)
+
+N = len(NODES)
+# which nodes receive the new write for a given W: the leaseholder plus W-1 followers,
+# the rest are cut off during the write so they keep the old value
+WRITE_SET = {1: {"A"}, 2: {"A", "B"}, 3: {"A", "B", "C"}}
+
+
+def stale_read_sets(cluster, w, r):
+    """Write 'old' everywhere, then 'new' with write quorum W so that exactly W nodes hold it.
+    Return every R-subset of nodes whose quorum read (highest timestamp wins) returned 'old'."""
+    assert cluster.client.put("k", "old", QUORUM_CP, node="A").acks_received == N
+
+    writers = WRITE_SET[w]
+    if len(writers) < N:
+        cluster.partition(writers, set(NODES) - writers)
+    reply = cluster.client.put("k", "new", QUORUM_CP, node="A")
+    assert reply.success and reply.acks_received == w
+    cluster.heal()  # anti-entropy is off, so the stale copies stay stale
+
+    stale = []
+    for subset in itertools.combinations(NODES, r):
+        best, _ = cluster.client.get_quorum("k", r, nodes=subset)
+        if best.value != "new":
+            stale.append(subset)
+    return stale
+
+
+@pytest.mark.parametrize("w", [1, 2, 3])
+@pytest.mark.parametrize("r", [1, 2, 3])
+def test_quorum_intersection(make_cluster, w, r):
+    cluster = make_cluster(sync_interval_ms=0, write_quorum=w)
+    stale = stale_read_sets(cluster, w, r)
+    if r + w > N:
+        # every read quorum overlaps every write quorum in at least one node -> always fresh
+        assert stale == [], f"R={r}, W={w}: stale read from {stale}"
+    else:
+        # some read quorum misses all W writers -> a stale read is possible
+        assert stale, f"R={r}, W={w}: expected at least one stale read quorum"
