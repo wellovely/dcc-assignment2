@@ -11,6 +11,8 @@ import grpc
 
 import counter_pb2
 import counter_pb2_grpc
+import kvstore_pb2
+import kvstore_pb2_grpc
 from clocks import LamportClock
 
 # Only these errors mean "the call may not have reached the server / the reply was lost".
@@ -112,11 +114,100 @@ class CounterClient:
         raise last_error
 
 
+# ======================================================================
+# Lab 6-7: key-value client
+# ======================================================================
+
+KV_NODES = "localhost:50051,localhost:50052,localhost:50053"  # A (leaseholder), B, C
+STRATEGIES = {"cp": kvstore_pb2.QUORUM_CP, "ap": kvstore_pb2.ALWAYS_AP}
+CONSISTENCIES = {"linearizable": kvstore_pb2.LINEARIZABLE, "stale": kvstore_pb2.FOLLOWER_STALE}
+
+
+class KVClient:
+    """Talks to the KeyValueStore service. Every call picks the node it is sent to.
+
+    nodes: {'A': 'localhost:50051', ...} or a comma-separated address list, named A, B, C in order."""
+
+    def __init__(self, nodes=KV_NODES, timeout=2.0):
+        if isinstance(nodes, str):
+            nodes = nodes.split(",")
+        if not isinstance(nodes, dict):
+            nodes = {"ABCDEFG"[i]: addr for i, addr in enumerate(nodes)}
+        self.nodes = nodes
+        self.timeout = timeout
+        self._channels = {name: grpc.insecure_channel(addr) for name, addr in nodes.items()}
+        self._stubs = {name: kvstore_pb2_grpc.KeyValueStoreStub(c) for name, c in self._channels.items()}
+
+    def close(self):
+        for channel in self._channels.values():
+            channel.close()
+
+    def put(self, key, value, strategy=kvstore_pb2.QUORUM_CP, node="A", timestamp=0, idempotency_key=None):
+        request = kvstore_pb2.PutRequest(key=key, value=value, strategy=strategy, timestamp=timestamp,
+                                         idempotency_key=idempotency_key or str(uuid.uuid4()))
+        return self._stubs[node].Put(request, timeout=self.timeout)
+
+    def get(self, key, consistency=kvstore_pb2.LINEARIZABLE, max_staleness_ms=0, node="A"):
+        """Raises grpc.RpcError: UNAVAILABLE (no leaseholder) or FAILED_PRECONDITION (STALE_READ_EXCEEDED)."""
+        request = kvstore_pb2.GetRequest(key=key, consistency=consistency, max_staleness_ms=max_staleness_ms)
+        return self._stubs[node].Get(request, timeout=self.timeout)
+
+    def get_quorum(self, key, r, nodes=None):
+        """Quorum read: read the local copy of R nodes and keep the version with the highest timestamp.
+        With R + W > N at least one of them holds the latest committed write.
+        Returns (best reply, {node: reply}). Raises RuntimeError if fewer than R nodes answer."""
+        replies = {}
+        for name in nodes or self.nodes:
+            if len(replies) == r:
+                break
+            try:
+                replies[name] = self.get(key, kvstore_pb2.FOLLOWER_STALE, 0, node=name)
+            except grpc.RpcError:
+                continue
+        if len(replies) < r:
+            raise RuntimeError(f"read quorum not reached: {len(replies)}/{r} nodes answered")
+        best = max(replies.values(), key=lambda reply: reply.read_timestamp)
+        return best, replies
+
+
+def run_kv(args):
+    """The put / kv-get commands. Returns the exit code."""
+    client = KVClient(args.addr or KV_NODES)
+    try:
+        if args.cmd == "put":
+            reply = client.put(args.key, args.value, STRATEGIES[args.strategy], args.node, args.timestamp)
+            if reply.success:
+                print(f"OK {args.strategy.upper()} write via {args.node} (acks: {reply.acks_received})")
+                return 0
+            print(f"FAILED via {args.node}: {reply.error_message} (acks: {reply.acks_received})")
+            return 1
+        if args.r:
+            reply, replies = client.get_quorum(args.key, args.r)
+            print(f"quorum read R={args.r} from {','.join(replies)}: "
+                  + (f"value={reply.value} ts={reply.read_timestamp}" if reply.found else "not found"))
+            return 0
+        reply = client.get(args.key, CONSISTENCIES[args.consistency], args.max_staleness_ms, args.node)
+        if reply.found:
+            print(f"value={reply.value} ts={reply.read_timestamp} stale={'yes' if reply.is_stale else 'no'}")
+        else:
+            print("not found")
+        return 0
+    except grpc.RpcError as e:
+        print(f"FAILED: {e.code().name} {e.details()}")
+        return 1
+    except RuntimeError as e:
+        print(f"FAILED: {e}")
+        return 1
+    finally:
+        client.close()
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Counter client")
-    parser.add_argument("--addr", default="localhost:50051",
+    parser = argparse.ArgumentParser(description="Counter and key-value client")
+    parser.add_argument("--addr", default=None,
                         help="replica address(es), comma-separated, e.g. "
-                             "localhost:50051,localhost:50052,localhost:50053")
+                             "localhost:50051,localhost:50052,localhost:50053 "
+                             "(default: localhost:50051 for incr/get, all three for put/kv-get)")
     parser.add_argument("--name", default="client-1", help="process name in the event log")
     parser.add_argument("--log", default=None, help="event log file (default: stderr)")
     parser.add_argument("--repeat", type=int, default=1,
@@ -131,8 +222,26 @@ def main():
     p_get = sub.add_parser("get", help="read a counter")
     p_get.add_argument("counter_id")
 
+    # Lab 6-7: key-value store. Nodes in --addr are named A, B, C in order; A is the leaseholder.
+    p_put = sub.add_parser("put", help="write a key (KV store)")
+    p_put.add_argument("key")
+    p_put.add_argument("value")
+    p_put.add_argument("--strategy", choices=STRATEGIES, default="cp", help="cp = QUORUM_CP, ap = ALWAYS_AP")
+    p_put.add_argument("--node", default="A", help="node to send the write to")
+    p_put.add_argument("--timestamp", type=int, default=0, help="write timestamp (default: assigned by the node)")
+
+    p_kv_get = sub.add_parser("kv-get", help="read a key (KV store)")
+    p_kv_get.add_argument("key")
+    p_kv_get.add_argument("--consistency", choices=CONSISTENCIES, default="linearizable")
+    p_kv_get.add_argument("--max-staleness-ms", type=int, default=0, help="bound for stale reads (0 = none)")
+    p_kv_get.add_argument("--node", default="A", help="node to send the read to")
+    p_kv_get.add_argument("--r", type=int, default=0, help="quorum read from R nodes instead")
+
     args = parser.parse_args()
-    client = CounterClient(args.addr, name=args.name, log_path=args.log)
+    if args.cmd in ("put", "kv-get"):
+        sys.exit(run_kv(args))
+
+    client = CounterClient(args.addr or "localhost:50051", name=args.name, log_path=args.log)
     failed = False
     try:
         for _ in range(args.repeat):
