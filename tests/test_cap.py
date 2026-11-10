@@ -13,15 +13,27 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 
+import grpc
 import pytest
 
 from client import KVClient
-from kvstore_pb2 import FOLLOWER_STALE, LINEARIZABLE, QUORUM_CP
+from kvstore_pb2 import ALWAYS_AP, FOLLOWER_STALE, LINEARIZABLE, QUORUM_CP
 from test_failures import ROOT, free_port, wait_until_listening
 
 NODES = "ABC"
 DC1, DC2 = {"A", "B"}, {"C"}
+
+
+def eventually(check, timeout=3.0):
+    """Poll until check() is true (anti-entropy is asynchronous)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if check():
+            return True
+        time.sleep(0.05)
+    return check()
 
 
 # ---------------------------------------------------------------- network simulation
@@ -206,3 +218,63 @@ def test_cp_write_on_minority_partition_fails(cap):
     # consistency is kept: the rejected write is visible nowhere
     assert all(cap.local_value(n, "x") is None for n in NODES)
     assert cap.client.get("x", LINEARIZABLE, node="A").found is False
+
+
+# ---------------------------------------------------------------- Part B: AP mode (sloppy quorum / LWW)
+
+def test_ap_write_on_minority_partition_is_accepted(cap):
+    cap.partition(DC1, DC2)
+    reply = cap.client.put("x", "dc2", ALWAYS_AP, node="C")
+    assert reply.success and reply.acks_received == 1  # only C itself holds it
+    assert cap.local_value("C", "x") == "dc2"
+    assert cap.local_value("A", "x") is None  # divergence: DC-1 does not know about it
+
+
+@pytest.mark.parametrize("ts_dc1, ts_dc2, winner", [
+    (1_000, 2_000, "dc2"),  # the minority wrote later -> its value wins
+    (2_000, 1_000, "dc1"),  # the majority wrote later -> the minority's write is discarded
+])
+def test_lww_merges_divergent_values_after_heal(cap, ts_dc1, ts_dc2, winner):
+    cap.partition(DC1, DC2)
+    assert cap.client.put("x", "dc1", QUORUM_CP, node="A", timestamp=ts_dc1).success
+    assert cap.client.put("x", "dc2", ALWAYS_AP, node="C", timestamp=ts_dc2).success
+    assert cap.local_value("A", "x") == "dc1" and cap.local_value("C", "x") == "dc2"
+
+    cap.heal()  # partition recovery: anti-entropy exchanges state, LWW picks the newer timestamp
+    assert eventually(lambda: all(cap.local_value(n, "x") == winner for n in NODES))
+    reply = cap.client.get("x", LINEARIZABLE, node="A")  # the leaseholder's authoritative value
+    assert reply.value == winner and reply.read_timestamp == max(ts_dc1, ts_dc2)
+
+
+# ---------------------------------------------------------------- read paths and staleness bound
+
+def test_follower_read_within_staleness_bound_is_served_locally(cap):
+    assert cap.client.put("x", "v1", QUORUM_CP, node="A").success
+    reply = cap.client.get("x", FOLLOWER_STALE, max_staleness_ms=5000, node="C")
+    assert reply.found and reply.value == "v1"
+    assert reply.is_stale  # served by a follower, not by the leaseholder
+    assert not cap.client.get("x", LINEARIZABLE, node="C").is_stale
+
+
+def test_stale_read_exceeded_on_isolated_follower(cap):
+    assert cap.client.put("x", "v1", QUORUM_CP, node="A").success
+    cap.partition(DC1, DC2)
+    time.sleep(0.5)  # C stops hearing from the leaseholder
+
+    with pytest.raises(grpc.RpcError) as error:
+        cap.client.get("x", FOLLOWER_STALE, max_staleness_ms=300, node="C")
+    assert error.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+    assert "STALE_READ_EXCEEDED" in error.value.details()
+
+    # a looser bound still lets the minority answer (availability over freshness)
+    assert cap.client.get("x", FOLLOWER_STALE, max_staleness_ms=5000, node="C").value == "v1"
+
+
+def test_linearizable_read_unavailable_on_minority(cap):
+    assert cap.client.put("x", "v1", QUORUM_CP, node="A").success
+    cap.partition(DC1, DC2)
+
+    with pytest.raises(grpc.RpcError) as error:
+        cap.client.get("x", LINEARIZABLE, node="C")  # C cannot reach the leaseholder
+    assert error.value.code() == grpc.StatusCode.UNAVAILABLE
+    assert cap.client.get("x", LINEARIZABLE, node="B").value == "v1"  # the majority side still can
