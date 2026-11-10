@@ -1,13 +1,18 @@
 import argparse
 import os
+import re
+import sys
 import threading
 import time
 from concurrent import futures
+from dataclasses import dataclass
 
 import grpc
 
 import counter_pb2
 import counter_pb2_grpc
+import kvstore_pb2
+import kvstore_pb2_grpc
 from clocks import LamportClock
 
 # C3 fault injection. Each fault affects only the FIRST Increment this replica receives.
@@ -91,12 +96,138 @@ class CounterServicer(counter_pb2_grpc.CounterServicer):
         return counter_pb2.GetReply(value=value, found=found, lamport_time=lamport_time)
 
 
-def start_server(port=0, name=None, log_path=None, fault=None, delay_ms=0):
-    """Start a server in the background. port=0 means 'pick any free port' (used by tests)."""
+# ======================================================================
+# Lab 6-7: key-value node with configurable consistency (KeyValueStore service)
+# ======================================================================
+
+LEASEHOLDER = "A"                 # Node 1 (port 50051) holds the lease for the keyspace [a-z]
+KEY_RANGE = re.compile(r"^[a-z]")  # keys whose first character is a-z
+
+
+def now_us():
+    return time.time_ns() // 1000
+
+
+class HybridClock:
+    """Write timestamps: wall clock in microseconds, but never smaller than the last one
+    issued or seen, so the timestamps of one node are strictly increasing."""
+
+    def __init__(self):
+        self._last = 0
+        self._lock = threading.Lock()
+
+    def next(self):
+        with self._lock:
+            self._last = max(now_us(), self._last + 1)
+            return self._last
+
+    def observe(self, timestamp):
+        with self._lock:
+            self._last = max(self._last, timestamp)
+
+
+@dataclass(frozen=True)
+class Version:
+    value: str
+    timestamp: int  # microseconds
+    origin: str     # node that accepted the write
+
+    def wins_over(self, other):
+        """Last-Write-Wins: the higher timestamp wins; equal timestamps are broken by node name."""
+        return other is None or (self.timestamp, self.origin) > (other.timestamp, other.origin)
+
+
+class LWWStore:
+    """key -> Version. Every update goes through apply(), so all replicas that receive the
+    same set of versions end up with the same state, whatever the delivery order."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._data = {}
+
+    def apply(self, key, version):
+        with self._lock:
+            if version.wins_over(self._data.get(key)):
+                self._data[key] = version
+                return True
+            return False
+
+    def get(self, key):
+        with self._lock:
+            return self._data.get(key)
+
+    def entries(self):
+        with self._lock:
+            return list(self._data.items())
+
+
+def parse_peers(text):
+    """'B=localhost:50052,C=localhost:50053' -> {'B': 'localhost:50052', 'C': 'localhost:50053'}"""
+    peers = {}
+    for item in filter(None, (text or "").split(",")):
+        name, addr = item.split("=", 1)
+        peers[name.strip()] = addr.strip()
+    return peers
+
+
+class KVNode(kvstore_pb2_grpc.KeyValueStoreServicer):
+    def __init__(self, node=LEASEHOLDER, peers=None, leaseholder=LEASEHOLDER, log_path=None):
+        self.node = node
+        self.peers = dict(peers or {})  # name -> address of every OTHER node
+        self.leaseholder = leaseholder
+        self.store = LWWStore()
+        self.clock = HybridClock()
+        self._out = open(log_path, "a", buffering=1) if log_path else sys.stderr
+
+    @property
+    def is_leaseholder(self):
+        return self.node == self.leaseholder
+
+    def log(self, event, text):
+        print(f"[{self.node}] {event:<8} {text}", file=self._out, flush=True)
+
+    def _check_key(self, key, context):
+        if not KEY_RANGE.match(key):
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT,
+                          f"key {key!r} is outside the keyspace [a-z] of leaseholder {self.leaseholder}")
+
+    def _new_version(self, request):
+        """A client-supplied timestamp is used as is (deterministic tests); otherwise the clock assigns one."""
+        if request.timestamp:
+            self.clock.observe(request.timestamp)
+            return Version(request.value, request.timestamp, self.node)
+        return Version(request.value, self.clock.next(), self.node)
+
+    def _local_reply(self, key, is_stale):
+        version = self.store.get(key)
+        if version is None:
+            return kvstore_pb2.GetReply(found=False, is_stale=is_stale)
+        return kvstore_pb2.GetReply(value=version.value, found=True,
+                                    read_timestamp=version.timestamp, is_stale=is_stale)
+
+    def Put(self, request, context):
+        self._check_key(request.key, context)
+        version = self._new_version(request)
+        applied = self.store.apply(request.key, version)
+        self.log("APPLY" if applied else "OLDER", f"{request.key}={request.value!r} ts={version.timestamp}")
+        return kvstore_pb2.PutReply(success=True, acks_received=1)
+
+    def Get(self, request, context):
+        self._check_key(request.key, context)
+        return self._local_reply(request.key, is_stale=not self.is_leaseholder)
+
+
+def start_server(port=0, name=None, log_path=None, fault=None, delay_ms=0,
+                 node=None, peers=None, leaseholder=LEASEHOLDER):
+    """Start a server in the background. port=0 means 'pick any free port' (used by tests).
+    One gRPC server hosts both services: Counter (Assignment 2) and KeyValueStore (Lab 6-7)."""
     servicer = CounterServicer(name or f"replica-{port}", log_path, fault, delay_ms)
-    # A3: up to 8 requests are handled in parallel; shared state is guarded by servicer._lock
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
+    kv = KVNode(node or leaseholder, peers, leaseholder, log_path)
+    # A3: requests are handled in parallel; shared state is guarded by locks.
+    # 16 workers: a node may block one worker while it forwards a request to the leaseholder.
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
     counter_pb2_grpc.add_CounterServicer_to_server(servicer, server)
+    kvstore_pb2_grpc.add_KeyValueStoreServicer_to_server(kv, server)
     bound_port = server.add_insecure_port(f"[::]:{port}")
     server.start()
     return server, bound_port, servicer
@@ -111,10 +242,19 @@ def main():
                         help="crash on the first Increment, before or after applying it")
     parser.add_argument("--delay-ms", type=int, default=0,
                         help="delay the reply to the first Increment by this many ms")
+    # Lab 6-7: key-value cluster
+    parser.add_argument("--node", default=None,
+                        help="node name in the KV cluster: A, B or C (default: the leaseholder, A)")
+    parser.add_argument("--peers", default="",
+                        help="the other nodes, e.g. B=localhost:50052,C=localhost:50053")
+    parser.add_argument("--leaseholder", default=LEASEHOLDER, help="name of the leaseholder node for [a-z]")
     args = parser.parse_args()
 
-    server, port, _ = start_server(args.port, args.name, args.log, args.fault, args.delay_ms)
-    print(f"server listening on port {port}", flush=True)
+    server, port, _ = start_server(args.port, args.name, args.log, args.fault, args.delay_ms,
+                                   node=args.node, peers=parse_peers(args.peers),
+                                   leaseholder=args.leaseholder)
+    role = "leaseholder" if (args.node or args.leaseholder) == args.leaseholder else "follower"
+    print(f"server listening on port {port} (KV node {args.node or args.leaseholder}, {role})", flush=True)
     server.wait_for_termination()
 
 
