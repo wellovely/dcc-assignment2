@@ -183,8 +183,12 @@ def to_entry(key, version):
 
 class KVNode(kvstore_pb2_grpc.KeyValueStoreServicer, kvstore_pb2_grpc.ReplicaSyncServicer):
     def __init__(self, node=LEASEHOLDER, peers=None, leaseholder=LEASEHOLDER, log_path=None,
-                 write_quorum=None):
+                 write_quorum=None, sync_interval_ms=200):
         self.node = node
+        self.sync_interval_ms = sync_interval_ms  # anti-entropy period, 0 = off
+        # monotonic time of the last message from the leaseholder (Replicate or Sync);
+        # a follower's staleness is measured from here
+        self._last_leaseholder_contact = None
         self.peers = dict(peers or {})  # name -> address of every OTHER node
         self.leaseholder = leaseholder
         self.n = len(self.peers) + 1
@@ -312,27 +316,96 @@ class KVNode(kvstore_pb2_grpc.KeyValueStoreServicer, kvstore_pb2_grpc.ReplicaSyn
 
     # ---------------------------------------------------------------- node-to-node
 
-    def Replicate(self, request, context):
-        entry = request.entry
+    def _merge(self, entry):
         self.clock.observe(entry.timestamp)
-        applied = self.store.apply(entry.key, Version(entry.value, entry.timestamp, entry.origin))
+        return self.store.apply(entry.key, Version(entry.value, entry.timestamp, entry.origin))
+
+    def _heard_from(self, sender):
+        if sender == self.leaseholder:
+            self._last_leaseholder_contact = time.monotonic()
+
+    def Replicate(self, request, context):
+        self._heard_from(request.sender)
+        entry = request.entry
+        applied = self._merge(entry)
         self.log("REPLICA" if applied else "OLDER",
                  f"{entry.key}={entry.value!r} ts={entry.timestamp} from {request.sender}")
         return kvstore_pb2.ReplicateReply(applied=applied)
 
+    def Sync(self, request, context):
+        self._heard_from(request.sender)
+        applied = [e for e in request.entries if self._merge(e)]
+        for e in applied:
+            self.log("SYNC", f"{e.key}={e.value!r} ts={e.timestamp} from {request.sender} (LWW winner)")
+        return kvstore_pb2.SyncReply(applied=len(applied))
+
+    def start_anti_entropy(self):
+        """Every sync_interval_ms push the whole local state to every peer; the receiver merges it
+        with LWW. This heals divergence after a partition and doubles as the leaseholder heartbeat
+        that bounds follower staleness. (Full-state push is fine for a lab-sized store.)"""
+        if not self.peers or not self.sync_interval_ms:
+            return
+        threading.Thread(target=self._anti_entropy_loop, daemon=True).start()
+
+    def _anti_entropy_loop(self):
+        def push(stub, request):
+            try:
+                stub.Sync(request, timeout=PEER_TIMEOUT)
+            except grpc.RpcError:
+                pass  # peer unreachable: try again next round
+
+        while True:
+            time.sleep(self.sync_interval_ms / 1000)
+            request = kvstore_pb2.SyncRequest(
+                entries=[to_entry(k, v) for k, v in self.store.entries()], sender=self.node)
+            list(self._pool.map(lambda stub: push(stub, request), self._sync_stubs.values()))
+
     # ---------------------------------------------------------------- reads
+
+    def staleness_ms(self):
+        """How far this node may lag behind the leaseholder: time since it last heard from it."""
+        if self.is_leaseholder:
+            return 0.0
+        if self._last_leaseholder_contact is None:
+            return float("inf")
+        return (time.monotonic() - self._last_leaseholder_contact) * 1000
 
     def Get(self, request, context):
         self._check_key(request.key, context)
+
+        if request.consistency == kvstore_pb2.LINEARIZABLE:
+            # only the leaseholder may answer; a follower proxies the read to it
+            if self.is_leaseholder:
+                return self._local_reply(request.key, is_stale=False)
+            stub = self._kv_stubs.get(self.leaseholder)
+            if stub is not None:
+                try:
+                    return stub.Get(request, timeout=PEER_TIMEOUT)
+                except grpc.RpcError:
+                    pass
+            self.log("UNAVAIL", f"linearizable read of {request.key}: leaseholder unreachable")
+            context.abort(grpc.StatusCode.UNAVAILABLE,
+                          f"leaseholder {self.leaseholder} unreachable from {self.node}: "
+                          f"linearizable read not possible")
+
+        # FOLLOWER_STALE: served from the local copy if it is fresh enough (0 = no bound)
+        lag = self.staleness_ms()
+        if request.max_staleness_ms and lag > request.max_staleness_ms:
+            lag_text = "never synced" if lag == float("inf") else f"lag {lag:.0f} ms"
+            self.log("STALE", f"read of {request.key}: {lag_text} > {request.max_staleness_ms} ms")
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION,
+                          f"STALE_READ_EXCEEDED: {self.node} {lag_text} > "
+                          f"max_staleness_ms={request.max_staleness_ms}")
         return self._local_reply(request.key, is_stale=not self.is_leaseholder)
 
 
 def start_server(port=0, name=None, log_path=None, fault=None, delay_ms=0,
-                 node=None, peers=None, leaseholder=LEASEHOLDER, write_quorum=None):
+                 node=None, peers=None, leaseholder=LEASEHOLDER, write_quorum=None,
+                 sync_interval_ms=200):
     """Start a server in the background. port=0 means 'pick any free port' (used by tests).
     One gRPC server hosts both services: Counter (Assignment 2) and KeyValueStore (Lab 6-7)."""
     servicer = CounterServicer(name or f"replica-{port}", log_path, fault, delay_ms)
-    kv = KVNode(node or leaseholder, peers, leaseholder, log_path, write_quorum)
+    kv = KVNode(node or leaseholder, peers, leaseholder, log_path, write_quorum, sync_interval_ms)
     # A3: requests are handled in parallel; shared state is guarded by locks.
     # 16 workers: a node may block one worker while it forwards a request to the leaseholder.
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
@@ -341,6 +414,7 @@ def start_server(port=0, name=None, log_path=None, fault=None, delay_ms=0,
     kvstore_pb2_grpc.add_ReplicaSyncServicer_to_server(kv, server)
     bound_port = server.add_insecure_port(f"[::]:{port}")
     server.start()
+    kv.start_anti_entropy()
     return server, bound_port, servicer
 
 
@@ -361,11 +435,14 @@ def main():
     parser.add_argument("--leaseholder", default=LEASEHOLDER, help="name of the leaseholder node for [a-z]")
     parser.add_argument("--write-quorum", type=int, default=None,
                         help="W: acks needed to commit a QUORUM_CP write (default: majority, N/2+1)")
+    parser.add_argument("--sync-interval-ms", type=int, default=200,
+                        help="anti-entropy period in ms (0 = off)")
     args = parser.parse_args()
 
     server, port, _ = start_server(args.port, args.name, args.log, args.fault, args.delay_ms,
                                    node=args.node, peers=parse_peers(args.peers),
-                                   leaseholder=args.leaseholder, write_quorum=args.write_quorum)
+                                   leaseholder=args.leaseholder, write_quorum=args.write_quorum,
+                                   sync_interval_ms=args.sync_interval_ms)
     role = "leaseholder" if (args.node or args.leaseholder) == args.leaseholder else "follower"
     print(f"server listening on port {port} (KV node {args.node or args.leaseholder}, {role})", flush=True)
     server.wait_for_termination()
