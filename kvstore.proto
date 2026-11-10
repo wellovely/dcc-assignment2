@@ -1,0 +1,75 @@
+syntax = "proto3";
+
+package kvstore;
+
+enum ReadConsistency {
+  LINEARIZABLE = 0;   // Must hit Leaseholder / Quorum
+  FOLLOWER_STALE = 1; // Served by local replica; bounded staleness
+}
+
+enum WriteStrategy {
+  QUORUM_CP = 0; // Requires majority (N/2 + 1) ACKs; fails if quorum lost
+  ALWAYS_AP = 1; // Accepts write on any available node; logs vector clock / timestamp
+}
+
+message GetRequest {
+  string key = 1;
+  ReadConsistency consistency = 2;
+  uint32 max_staleness_ms = 3; // Used when consistency == FOLLOWER_STALE
+}
+
+message GetReply {
+  string value = 1;
+  bool found = 2;
+  uint64 read_timestamp = 3;
+  bool is_stale = 4;
+}
+
+message PutRequest {
+  string key = 1;
+  string value = 2;
+  string idempotency_key = 3;
+  WriteStrategy strategy = 4;
+  uint64 timestamp = 5;
+}
+
+message PutReply {
+  bool success = 1;
+  uint32 acks_received = 2;
+  string error_message = 3;
+}
+
+service KeyValueStore {
+  rpc Get (GetRequest) returns (GetReply);
+  rpc Put (PutRequest) returns (PutReply);
+}
+
+// ---------------------------------------------------------------------------
+// Internal node-to-node traffic (not used by clients).
+
+// One versioned entry. Conflicts are resolved by Last-Write-Wins on (timestamp, origin).
+message Entry {
+  string key = 1;
+  string value = 2;
+  uint64 timestamp = 3; // hybrid clock, microseconds
+  string origin = 4;    // node that accepted the write, tie-breaker for equal timestamps
+}
+
+message ReplicateRequest {
+  Entry entry = 1;
+  string sender = 2;
+}
+message ReplicateReply { bool applied = 1; }
+
+// Anti-entropy: the sender pushes its whole state; the receiver merges it with LWW.
+// A Sync from the leaseholder also refreshes the follower's staleness clock.
+message SyncRequest {
+  repeated Entry entries = 1;
+  string sender = 2;
+}
+message SyncReply { uint32 applied = 1; }
+
+service ReplicaSync {
+  rpc Replicate (ReplicateRequest) returns (ReplicateReply);
+  rpc Sync (SyncRequest) returns (SyncReply);
+}
