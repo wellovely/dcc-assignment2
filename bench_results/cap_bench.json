@@ -1,0 +1,68 @@
+{
+  "iterations": 1000,
+  "max_staleness_ms": 5000,
+  "python": "3.14.7",
+  "platform": "macOS-27.3-arm64-arm-64bit-Mach-O",
+  "phases": {
+    "healthy": {
+      "Linearizable": {
+        "median_ms": 0.273,
+        "p95_ms": 0.314,
+        "availability_pct": 100.0,
+        "ok": 1000,
+        "attempts": 1000,
+        "errors": {}
+      },
+      "Follower Stale": {
+        "median_ms": 0.126,
+        "p95_ms": 0.143,
+        "availability_pct": 100.0,
+        "ok": 1000,
+        "attempts": 1000,
+        "errors": {}
+      }
+    },
+    "leaseholder_down": {
+      "Linearizable": {
+        "median_ms": null,
+        "p95_ms": null,
+        "availability_pct": 0.0,
+        "ok": 0,
+        "attempts": 1000,
+        "errors": {
+          "UNAVAILABLE": 1000
+        }
+      },
+      "Follower Stale": {
+        "median_ms": 0.124,
+        "p95_ms": 0.141,
+        "availability_pct": 100.0,
+        "ok": 1000,
+        "attempts": 1000,
+        "errors": {}
+      }
+    },
+    "bound_exceeded": {
+      "Linearizable": {
+        "median_ms": null,
+        "p95_ms": null,
+        "availability_pct": 0.0,
+        "ok": 0,
+        "attempts": 1000,
+        "errors": {
+          "UNAVAILABLE": 1000
+        }
+      },
+      "Follower Stale": {
+        "median_ms": null,
+        "p95_ms": null,
+        "availability_pct": 0.0,
+        "ok": 0,
+        "attempts": 1000,
+        "errors": {
+          "FAILED_PRECONDITION": 1000
+        }
+      }
+    }
+  }
+}
